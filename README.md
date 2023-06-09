@@ -1,3 +1,4 @@
+# mysql_cli_client
 A simple wrapper for calling the mysql command line client from Dart.
 
 ```dart
@@ -20,4 +21,4 @@ A simple wrapper for calling the mysql command line client from Dart.
 
   var results = mysql.toList('select * from user');
 
-  ```# mysql_cli_client
+  ```

@@ -1,6 +1,7 @@
 name: mysql_cli_client
 version: 1.0.0
 description: A simple wrapper for calling the mysql command line client from Dart.
+repository: https://github.com/onepub-dev/mysql_cli_client
 environment: 
   sdk: ^3.0.2
 dependencies: 
