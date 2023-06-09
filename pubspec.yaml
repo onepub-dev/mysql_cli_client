@@ -1,6 +1,6 @@
-name: mysql_cli_wrapper
+name: mysql_cli_client
 version: 1.0.0
-description: A sample command-line application.
+description: A simple wrapper for calling the mysql command line client from Dart.
 environment: 
   sdk: ^3.0.2
 dependencies: 
