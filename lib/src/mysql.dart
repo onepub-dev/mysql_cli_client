@@ -4,187 +4,295 @@
  * Written by Brett Sutton <bsutton@onepub.dev>, Jan 2022
  */
 
-import 'package:dcli/dcli.dart';
+import 'dart:convert';
+import 'dart:io';
 
 import 'mysql_parser.dart';
 
+/// A redacted failure. Raw client diagnostics, SQL and credentials are omitted.
+class MySQLException implements Exception {
+  MySQLException(this.operation, {this.exitCode});
+  final String operation;
+  final int? exitCode;
+
+  @override
+  String toString() => 'MySQLException: $operation failed'
+      '${exitCode == null ? '' : ' (exit code $exitCode)'}';
+}
+
+/// Receives stdout only; diagnostics are intentionally not forwarded.
+/// Callbacks run after completion. [exitCode] is set even with noThrow.
+class MySQLProgress {
+  MySQLProgress({this.stdout});
+  final void Function(String line)? stdout;
+  int? exitCode;
+}
+
+/// Process boundary for synthetic testing. Implementations are trusted and can
+/// see credentials and SQL. Never log requests or raw failures.
+abstract class MySQLProcessRunner {
+  Future<MySQLProcessResult> run(String executable, List<String> arguments,
+      {required Map<String, String> environment,
+      required Stream<List<int>> input});
+
+  MySQLProcessResult runSync(String executable, List<String> arguments,
+      {required Map<String, String> environment});
+}
+
+class MySQLProcessResult {
+  MySQLProcessResult(this.exitCode, this.stdout, this.stderr);
+  final int exitCode;
+  final String stdout;
+  final String stderr;
+}
+
+class _ProcessRunner implements MySQLProcessRunner {
+  const _ProcessRunner();
+
+  @override
+  Future<MySQLProcessResult> run(String executable, List<String> arguments,
+      {required Map<String, String> environment,
+      required Stream<List<int>> input}) async {
+    final process = await Process.start(executable, arguments,
+        environment: environment,
+        // Explicitly retain the security boundary even though false is default.
+        // ignore: avoid_redundant_argument_values
+        runInShell: false);
+    final output = process.stdout
+        .transform(const Utf8Decoder(allowMalformed: true))
+        .join();
+    final errors = process.stderr
+        .transform(const Utf8Decoder(allowMalformed: true))
+        .join();
+    Future<void> writeInput() async {
+      await process.stdin.addStream(input);
+      await process.stdin.close();
+    }
+
+    try {
+      final results = await Future.wait<Object?>([
+        output,
+        errors,
+        process.exitCode,
+        writeInput(),
+      ], eagerError: true);
+      return MySQLProcessResult(
+          results[2]! as int, results[0]! as String, results[1]! as String);
+    } catch (_) {
+      process.kill(ProcessSignal.sigkill);
+      await process.stdin.close().catchError((Object _) {});
+      await process.exitCode;
+      await output;
+      await errors;
+      rethrow;
+    }
+  }
+
+  @override
+  MySQLProcessResult runSync(String executable, List<String> arguments,
+      {required Map<String, String> environment}) {
+    final result = Process.runSync(executable, arguments,
+        environment: environment,
+        // ignore: avoid_redundant_argument_values
+        runInShell: false);
+    return MySQLProcessResult(
+        result.exitCode, result.stdout as String, result.stderr as String);
+  }
+}
+
 class MySQL {
-  MySQL({
-    required this.user,
-    required this.password,
-    required this.schema,
-    this.host = '127.0.0.1',
-    this.port = 3306,
-  });
+  MySQL(
+      {required this.user,
+      required this.password,
+      required this.schema,
+      this.host = '127.0.0.1',
+      this.port = 3306,
+      MySQLProcessRunner? runner})
+      : _runner = runner ?? const _ProcessRunner();
+
   String user;
   String password;
   String schema;
   String host;
   int port;
+  final MySQLProcessRunner _runner;
+
+  // Restrict names to avoid wildcard semantics in GRANT database patterns.
+  String _schemaIdentifier() {
+    if (!RegExp(r'^[A-Za-z][A-Za-z0-9]{0,63}$').hasMatch(schema)) {
+      throw ArgumentError(
+          'Schema must be 1–64 ASCII letters/digits, starting with a letter.');
+    }
+    return '`$schema`';
+  }
+
+  static String _literal(String value) {
+    // Doubled apostrophes work with and without NO_BACKSLASH_ESCAPES.
+    // Reject mode-dependent backslashes and client line/control syntax.
+    if (value.runes.any((c) => c < 32 || c == 127 || c == 92)) {
+      throw ArgumentError(
+          'Account values cannot contain backslashes or control characters.');
+    }
+    return "'${value.replaceAll("'", "''")}'";
+  }
+
+  List<String> _connection({bool noschema = false}) {
+    if (port < 1 || port > 65535) {
+      throw ArgumentError('Port must be between 1 and 65535.');
+    }
+    return [
+      '--user=$user',
+      '--host=$host',
+      '--port=$port',
+      if (!noschema) '--database=$schema'
+    ];
+  }
+
+  Map<String, String> _environment() => {'MYSQL_PWD': password};
+
+  Future<MySQLProcessResult> _execute(
+      List<String> args, Stream<List<int>> input, String operation) async {
+    try {
+      return await _runner.run('mysql', List.unmodifiable(args),
+          environment: Map.unmodifiable(_environment()), input: input);
+    } on Object catch (_) {
+      throw MySQLException(operation);
+    }
+  }
+
+  void _check(MySQLProcessResult result, String operation) {
+    if (result.exitCode != 0) {
+      throw MySQLException(operation, exitCode: result.exitCode);
+    }
+  }
+
+  Stream<List<int>> _sqlInput(String sql) => Stream.value(utf8.encode(sql));
 
   Future<void> dropSchema() async {
-    final sql = 'drop database if exists $schema';
-    await run(sql, noschema: true);
+    final identifier = _schemaIdentifier();
+    await run('DROP DATABASE IF EXISTS $identifier;', noschema: true);
   }
 
   Future<void> createSchema() async {
-    final sql = 'create database if not exists $schema';
-    await run(sql, noschema: true);
-  }
-
-  Future<void> restore(String sourcePath) async {
-    await withEnvironment(
-      () async =>
-          ('cat $sourcePath' | 'mysql --user $user --host=$host $schema ').run,
-      environment: {'MYSQL_PWD': password},
-    );
+    final identifier = _schemaIdentifier();
+    await run('CREATE DATABASE IF NOT EXISTS $identifier;', noschema: true);
   }
 
   Future<void> createUser(
       {required String username, required String password}) async {
-    await withEnvironment(
-      () async {
-        final qualifiedUser = "'$username'@'$host'";
-        final cmd = '''
-DROP USER if exists $qualifiedUser;
-CREATE USER $qualifiedUser IDENTIFIED BY '$password'; 
-GRANT ALL ON $schema.* TO $qualifiedUser;
-flush privileges;'''
-            .replaceAll('\n', ' ');
-        await run(cmd);
-      },
-      environment: {'MYSQL_PWD': password},
-    );
+    final identifier = _schemaIdentifier();
+    final account = '${_literal(username)}@${_literal(host)}';
+    final secret = _literal(password);
+    await run(
+        'DROP USER IF EXISTS $account;\n'
+        'CREATE USER $account IDENTIFIED BY $secret;\n'
+        'GRANT ALL ON $identifier.* TO $account;\n'
+        'FLUSH PRIVILEGES;',
+        noschema: true,
+        progress: MySQLProgress());
   }
 
-  void backup(String savePath) {
-    env['MYSQL_PWD'] = password;
+  /// Streams the exact file bytes into mysql. Source failures always throw.
+  Future<void> restore(String sourcePath) async {
+    final result = await _execute([..._connection(), '--binary-mode'],
+        File(sourcePath).openRead(), 'restore');
+    _check(result, 'restore');
+  }
 
-    var v8 = false;
-    final progress = Progress((line) {
-      v8 |= line.contains('Ver 8.');
-    });
-    'mysqldump --version'.start(progress: progress);
-
-    var statistics = '';
-    if (v8) {
-      print('suppressing colum-statistics for mysqldump Ver 8.x');
-      statistics = '--column-statistics=0';
+  /// Synchronous for compatibility. Set [columnStatistics] only when supported
+  /// by the installed mysqldump; no credential-bearing version probe is made.
+  void backup(String savePath, {bool? columnStatistics}) {
+    _schemaIdentifier();
+    final args = [
+      ..._connection(noschema: true),
+      '--routines',
+      '--result-file=$savePath',
+      if (columnStatistics != null)
+        '--column-statistics=${columnStatistics ? 1 : 0}',
+      '--',
+      schema
+    ];
+    MySQLProcessResult result;
+    try {
+      result = _runner.runSync('mysqldump', List.unmodifiable(args),
+          environment: Map.unmodifiable(_environment()));
+    } on Object catch (_) {
+      throw MySQLException('backup');
     }
-
-    final cmd = 'mysqldump $statistics --user $user --host=$host $schema '
-        '--routines --result-file=$savePath';
-    Settings().verbose(cmd);
-    cmd.run;
-    // .forEach((line) => savePath.append(line));
+    _check(result, 'backup');
   }
 
-  ///
-  /// Pass [noschema] if the schema name should NOT be included in the
-  /// command.
-  ///
   Future<List<String>> toList(String sql,
       {bool noschema = false, bool table = false}) async {
-    final args = <String>[];
+    final result = await _execute([
+      ..._connection(noschema: noschema),
+      '--binary-mode',
+      if (table) '--table' else '--batch',
+    ], _sqlInput(sql), 'query');
+    _check(result, 'query');
     if (table) {
-      args.add('-t');
+      return const LineSplitter().convert(result.stdout);
     }
-
-    args.addAll(<String>['--user=$user', '--host=$host', '--port=$port']);
-    if (!noschema) {
-      args.add(schema);
+    if (result.stdout.isEmpty) {
+      return [];
     }
-    args
-      ..add('-e')
-      ..add(sql);
-
-    Settings().verbose('mysql $args');
-
-    return withEnvironment(
-      () async =>
-          startFromArgs('mysql', args, progress: Progress.capture()).toList(),
-      environment: {'MYSQL_PWD': password},
-    );
+    // Batch records end at LF only: raw CR is field data, even before LF.
+    final lines = result.stdout.split('\n');
+    if (lines.last.isEmpty) {
+      lines.removeLast();
+    }
+    return lines;
   }
 
-  ///
-  /// Run a mysql command returning a RecordSet
-  ///
+  /// Uses escaped batch output. Supply one SELECT per call. Values are strings,
+  /// including SQL NULL; multiple result sets cannot be represented.
   Future<RecordSet> runMysqlQuery(String sqlQuery) async =>
-      MySQLParser.parseResults(await toList(sqlQuery, table: true));
+      MySQLParser.parseBatch(await toList(sqlQuery));
 
-  /// Pass [noschema] if the schema name should NOT be included in the
-  /// command.
   Future<void> run(String sql,
-      {bool noschema = false, bool noThrow = false, Progress? progress}) async {
-    await runFromArgs(sql, [],
-        noschema: noschema, noThrow: noThrow, progress: progress);
-  }
+          {bool noschema = false,
+          bool noThrow = false,
+          MySQLProgress? progress}) =>
+      runFromArgs(sql, const [],
+          noschema: noschema, noThrow: noThrow, progress: progress);
 
-  ///
-  /// Pass [noschema] if the schema name should NOT be included in the
-  /// command.
-  ///
+  /// [args] is an intentional, trusted client-option interface. It is copied.
+  /// SQL is intentional executable input, sent unchanged through stdin.
   Future<void> runFromArgs(String sql, List<String> args,
-      {bool noschema = false, bool noThrow = false, Progress? progress}) async {
-    progress ??= Progress.print();
-
-    args.addAll(<String>['--user=$user', '--host=$host', '--port=$port']);
-    if (!noschema) {
-      args.add(schema);
+      {bool noschema = false,
+      bool noThrow = false,
+      MySQLProgress? progress}) async {
+    final result = await _execute([
+      ...args,
+      ..._connection(noschema: noschema),
+      '--binary-mode',
+    ], _sqlInput(sql), 'query');
+    progress?.exitCode = result.exitCode;
+    if (!noThrow) {
+      _check(result, 'query');
     }
-    args
-      ..add('-e')
-      ..add(sql);
-
-    Settings().verbose('mysql $args');
-
-    await withEnvironment(
-      () async {
-        startFromArgs('mysql', args, progress: progress, nothrow: noThrow);
-      },
-      environment: {'MYSQL_PWD': password},
-    );
+    for (final line in const LineSplitter().convert(result.stdout)) {
+      if (progress == null) {
+        // Retained public run() output behavior; diagnostics never reach here.
+        // ignore: avoid_print
+        print(line);
+      } else {
+        progress.stdout?.call(line);
+      }
+    }
   }
 
-  /// Indefinitely wait for mysql to start responding.
-  /// This is useful if you have just started mysql.
-  Future<void> waitForMysql() async {
-    final result = <String>[];
-    Progress progress;
-
-    var firstpass = true;
-    var success = false;
-
-    do {
-      if (!firstpass) {
-        print('Waiting for Mysql connection...');
-        firstpass = false;
-      }
-      progress = Progress(devNull, stderr: result.add);
-
-      await run('select 1', noschema: true, noThrow: true, progress: progress);
-
+  /// Retries failed commands; launch/I/O failures throw. Unlike 1.x, access
+  /// denied does not count as a usable connection. No diagnostics are printed.
+  Future<void> waitForMysql(
+      {Duration retryDelay = const Duration(seconds: 10)}) async {
+    while (true) {
+      final progress = MySQLProgress();
+      await run('SELECT 1;', noschema: true, noThrow: true, progress: progress);
       if (progress.exitCode == 0) {
-        success = true;
-      } else {
-        /// an access denied message also means we are up.
-        /// On the first install the user won't exist at this point.
-        if (result.length == 2 && result[1].contains('Access denied')) {
-          success = true;
-        } else {
-          print(orange(
-              'The following error may be due to mysql still initialising.'));
-
-          /// print the error
-          result.forEach(print);
-        }
+        return;
       }
-      result.clear();
-      if (!success) {
-        sleep(10);
-      }
-    } while (!success);
-    print('Connected to Mysql');
+      await Future<void>.delayed(retryDelay);
+    }
   }
 }
